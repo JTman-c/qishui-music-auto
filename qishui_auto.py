@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
@@ -48,7 +49,6 @@ USE_UIAUTOMATOR = False     # True / False / "auto"。默认关：它看不到�
 OCR_SCORE = 0.5             # OCR 置信度下限
 FUZZY = True                # 允许轻微识别误差
 POLL_INTERVAL = 0.1         # 每轮间隔（截图+OCR 本身约 0.8~1.5s）
-OCR_FALLBACK_INTERVAL = 2.5 # 保留：uiautomator 兜底时的最小间隔
 CLICK_COOLDOWN = 0.4        # 点击后冷却；同坐标重复点击由 do_click 的 3s 去重兜底
 MUTE_ON_START = False       # 默认不动音量；需要广告期间静音再改成 True
 OCR_MAX_WIDTH = 720         # OCR 缩放宽度（太小会漏「取消」等小字，别低于 600）
@@ -56,6 +56,13 @@ SAVE_CLICK_DEBUG = True     # 命中时保存标注截图
 DUMP_PATH = "/sdcard/qishui_dump.xml"
 UIA_TIMEOUT = 4             # uiautomator 单次超时；失败会浪费这么久，所以探测后就别频繁试
 UIA_MAX_FAIL = 3            # 连续失败几次后自动关闭 uiautomator
+
+# 卡死看门狗：连续多少轮没点到按钮判定为卡住，存一张现场截图并提示
+STALL_ROUNDS = 40
+# 卡住后是否按一次返回键尝试退出卡死浮层（保守默认关，确认需要再开）
+STALL_PRESS_BACK = False
+# 连续截图失败多少轮后提示 ADB / 设备掉线
+SCREEN_FAIL_LIMIT = 5
 
 # 各目标允许点击的区域（相对屏幕宽高 0~1）
 TARGET_ROI = {
@@ -76,16 +83,19 @@ CENTER_TARGETS = {"领取奖励", "继续观看", "领取第"}
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_clicks")
+LOG_PATH = os.path.join(SCRIPT_DIR, "run.log")
 
 click_seq = 0
 ocr_engine = None
-last_ocr_ts = 0.0
 screen_cache = None
 muted = False
 saved_volume = None
 uia_ok = None
 uia_fails = 0
 last_click = {"target": None, "x": -1, "y": -1, "ts": 0.0}
+# 点击统计
+total_clicks = 0
+click_counts = {}
 
 
 # ------------------------- adb 基础 -------------------------
@@ -98,6 +108,12 @@ def adb(args, binary=False, timeout=20):
         return r.stdout if binary else r.stdout.decode("utf-8", "ignore")
     except Exception:
         return None
+
+
+def device_online():
+    """adb devices 是否存在在线设备"""
+    out = adb(["devices"]) or ""
+    return any("\tdevice" in line for line in out.splitlines()[1:] if line.strip())
 
 
 def screen_size():
@@ -284,7 +300,7 @@ def save_debug(screen, x, y, target, label):
 
 def do_click(x, y, target, label, source, screen=None):
     """点击并抑制 3 秒内同一坐标的重复点击"""
-    global click_seq
+    global click_seq, total_clicks
     now = time.time()
     if (target == last_click["target"]
             and abs(x - last_click["x"]) < 20
@@ -293,6 +309,8 @@ def do_click(x, y, target, label, source, screen=None):
         return False
 
     click_seq += 1
+    total_clicks += 1
+    click_counts[target] = click_counts.get(target, 0) + 1
     last_click.update(target=target, x=x, y=y, ts=now)
     print(f"  >>> 点击 #{click_seq} [{datetime.now():%H:%M:%S}] "
           f"{target} <- 「{label}」 @({x},{y}) via {source}")
@@ -449,9 +467,36 @@ def unmute():
     print("🔊 已恢复音量")
 
 
+# ------------------------- 日志双写 -------------------------
+class _Tee:
+    """同时写到控制台和日志文件，保证事后能回看。"""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for st in self.streams:
+            try:
+                st.write(s)
+                st.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        for st in self.streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+
+
 # ------------------------- 主循环 -------------------------
 def main():
-    global last_ocr_ts, uia_fails
+    global uia_fails
+
+    log_fp = open(LOG_PATH, "a", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, log_fp)
+    sys.stderr = _Tee(sys.__stderr__, log_fp)
 
     use_ocr = ocr_available()
     use_uia = uia_available()
@@ -463,37 +508,54 @@ def main():
           f"uiautomator: {'开' if use_uia else '关'}")
     print(f"   领奖目标: {REWARD_TARGETS}")
     print(f"   跳过目标: {SKIP_TARGETS if ENABLE_SKIP else '已禁用'}")
+    if not device_online():
+        print("⚠️  adb devices 未发现在线设备：检查数据线、USB 调试与授权")
     print("   停止请按 Ctrl + C")
     print("-" * 50)
 
     if not use_ocr and not use_uia:
         print("❌ 没有可用通道：请 pip install -r requirements.txt")
+        log_fp.close()
         return
 
     mute_on_start()
     idle = 0
+    fail_streak = 0
+    last_screen = None
     try:
         while True:
             clicked = False
 
-            # 主通道：OCR。奖励弹窗等覆盖层 uiautomator 抓不到，必须靠 OCR
-            if use_ocr:
-                screen = screenshot()
-                if screen is not None and match_and_click(ocr_nodes(screen), "ocr", screen):
-                    clicked = True
+            # 单轮异常不中断主循环，记录后继续下一轮
+            try:
+                # 主通道：OCR。奖励弹窗等覆盖层 uiautomator 抓不到，必须靠 OCR
+                if use_ocr:
+                    screen = screenshot()
+                    if screen is None:
+                        fail_streak += 1
+                        if fail_streak == SCREEN_FAIL_LIMIT:
+                            print("⚠️  连续截图失败：检查 ADB 连接、手机是否掉线或锁屏")
+                    else:
+                        fail_streak = 0
+                        last_screen = screen
+                        if match_and_click(ocr_nodes(screen), "ocr", screen):
+                            clicked = True
 
-            # 兜底：OCR 没找到时才用 uiautomator
-            if not clicked and use_uia:
-                nodes = dump_nodes(timeout=UIA_TIMEOUT)
-                if nodes is None:
-                    uia_fails += 1
-                    if uia_fails >= UIA_MAX_FAIL:
-                        print(f"⚠️  uiautomator 连续失败 {uia_fails} 次，本次会话关闭")
-                        use_uia = False
-                else:
-                    uia_fails = 0
-                    if match_and_click(nodes, "uia"):
-                        clicked = True
+                # 兜底：OCR 没找到时才用 uiautomator
+                if not clicked and use_uia:
+                    nodes = dump_nodes(timeout=UIA_TIMEOUT)
+                    if nodes is None:
+                        uia_fails += 1
+                        if uia_fails >= UIA_MAX_FAIL:
+                            print(f"⚠️  uiautomator 连续失败 {uia_fails} 次，本次会话关闭")
+                            use_uia = False
+                    else:
+                        uia_fails = 0
+                        if match_and_click(nodes, "uia"):
+                            clicked = True
+            except Exception:
+                print("⚠️  本轮处理出现异常，已跳过本轮：")
+                traceback.print_exc()
 
             if clicked:
                 idle = 0
@@ -503,12 +565,30 @@ def main():
             idle += 1
             if idle % 10 == 0:
                 print(f"· 等待中…（{idle} 轮，未发现可点按钮）")
+
+            # 卡死看门狗：连续多轮无可点按钮，存现场截图；可选按一次返回键
+            if idle == STALL_ROUNDS:
+                print(f"⚠️  已连续 {STALL_ROUNDS} 轮没有可点按钮，可能卡在异常页面")
+                if last_screen is not None:
+                    save_debug(last_screen, sw // 2, sh // 2, "卡死现场", "stall")
+                if STALL_PRESS_BACK:
+                    print("· 按一次返回键尝试退出卡死浮层")
+                    adb(["shell", "input", "keyevent", "4"])
+
             time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
         print("\n已停止")
     finally:
         unmute()
+        print("-" * 50)
+        print(f"📊 本次共点击 {total_clicks} 次")
+        for target, count in sorted(click_counts.items(), key=lambda kv: -kv[1]):
+            print(f"   {target}: {count}")
+        try:
+            log_fp.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
